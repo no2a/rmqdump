@@ -1,0 +1,6 @@
+host = "rabbitmq-1.example.com"
+user = "rabbitmq"
+password = "password"
+vhost = "/"
+output = "/tmp/rmqdump"
+rotation_size = 100000000
