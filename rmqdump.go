@@ -18,16 +18,6 @@ import (
 	"unsafe"
 )
 
-const (
-	traceExchange      = "amq.rabbitmq.trace"
-	traceQueue         = "trace-q"
-	deadLetterExchange = "trace-dlx"
-	deadLetterQueue    = "trace-dlq"
-	expireMilliSec     = 10000
-	maxQueueLength     = 100000
-	maxQueueLengthByte = 64 * 1024 * 1024
-)
-
 func failOnError(err error, msg string) {
 	if err != nil {
 		log.Printf("%s: %s\n", msg, err)
@@ -36,16 +26,24 @@ func failOnError(err error, msg string) {
 }
 
 type Config struct {
-	Host          string `toml:"host"`
-	User          string `toml:"user"`
-	Password      string `toml:"password"`
-	Vhost         string `toml:"vhost"`
-	Output        string `toml:"output"`
-	RotationBytes int64  `toml:"rotation_bytes"`
+	Host                string `toml:"host"`
+	User                string `toml:"user"`
+	Password            string `toml:"password"`
+	Vhost               string `toml:"vhost"`
+	Output              string `toml:"output"`
+	RotationBytes       int64  `toml:"rotation_bytes"`
+	ExpireMilliSec      int32  `toml:"expire_millisec"`
+	MaxQueueLength      int32  `toml:"max_queue_length"`
+	MaxQueueLengthBytes int64  `toml:"max_queue_length_bytes"`
+	TraceQueue          string `toml:"trace_queue"`
 }
 
 func loadConfig(path string) *Config {
 	cfg := Config{}
+	cfg.TraceQueue = "rmqdump"
+	cfg.ExpireMilliSec = 120000
+	cfg.MaxQueueLength = 10000
+	cfg.MaxQueueLengthBytes = 20000000
 	_, err := toml.DecodeFile(path, &cfg)
 	failOnError(err, "Failed to load config")
 	return &cfg
@@ -62,6 +60,10 @@ func (cfg *Config) getURI() string {
 	return uri.String()
 }
 
+func (cfg *Config) getNameForDeadLetter() string {
+	return cfg.TraceQueue + "-dl"
+}
+
 func enableTracing(cfg *Config) error {
 	uri := fmt.Sprintf("http://%s:15672", cfg.Host)
 	rmqc, _ := rabbithole.NewClient(uri, cfg.User, cfg.Password)
@@ -76,34 +78,36 @@ func enableTracing(cfg *Config) error {
 	return err
 }
 
-func declareQueues(channel *amqp.Channel) error {
-	err := channel.ExchangeDeclare(deadLetterExchange, "fanout", false, true, false, false, nil)
+func declareQueues(channel *amqp.Channel, cfg *Config) error {
+	dlx := cfg.getNameForDeadLetter()
+	dlq := cfg.getNameForDeadLetter()
+	err := channel.ExchangeDeclare(dlx, "fanout", false, true, false, false, nil)
 	if err != nil {
 		return err
 	}
-	deadLetterQueueArgs := amqp.Table{
-		"x-expires":    int32(expireMilliSec),
+	dlqArgs := amqp.Table{
+		"x-expires":    cfg.ExpireMilliSec,
 		"x-max-length": int32(1),
 	}
-	_, err = channel.QueueDeclare(deadLetterQueue, false, false, false, false, deadLetterQueueArgs)
+	_, err = channel.QueueDeclare(dlq, false, false, false, false, dlqArgs)
 	if err != nil {
 		return err
 	}
-	err = channel.QueueBind(deadLetterQueue, "", deadLetterExchange, false, nil)
+	err = channel.QueueBind(dlq, "", dlx, false, nil)
 	if err != nil {
 		return err
 	}
-	traceQueueArgs := amqp.Table{
-		"x-expires":              int32(expireMilliSec),
-		"x-max-length":           int32(maxQueueLength),
-		"x-max-length-bytes":     int64(maxQueueLengthByte),
-		"x-dead-letter-exchange": deadLetterExchange,
+	qArgs := amqp.Table{
+		"x-expires":              cfg.ExpireMilliSec,
+		"x-max-length":           cfg.MaxQueueLength,
+		"x-max-length-bytes":     cfg.MaxQueueLengthBytes,
+		"x-dead-letter-exchange": dlx,
 	}
-	_, err = channel.QueueDeclare(traceQueue, false, false, false, false, traceQueueArgs)
+	_, err = channel.QueueDeclare(cfg.TraceQueue, false, false, false, false, qArgs)
 	if err != nil {
 		return err
 	}
-	err = channel.QueueBind(traceQueue, "publish.#", traceExchange, false, nil)
+	err = channel.QueueBind(cfg.TraceQueue, "publish.#", "amq.rabbitmq.trace", false, nil)
 	if err != nil {
 		return err
 	}
@@ -259,13 +263,13 @@ func startConsume(cfg *Config, stopC <-chan StopCommand) <-chan Record {
 			log.Printf("Failed to open a channel: %s\n", err)
 			return
 		}
-		declareQueues(channel)
-		messageC, err := channel.Consume(traceQueue, "", true, false, false, false, nil)
+		declareQueues(channel, cfg)
+		messageC, err := channel.Consume(cfg.TraceQueue, "", true, false, false, false, nil)
 		if err != nil {
 			log.Printf("Failed to consume trace queue: %s\n", err)
 			return
 		}
-		deadMessageC, err := channel.Consume(deadLetterQueue, "", true, false, false, false, nil)
+		deadMessageC, err := channel.Consume(cfg.getNameForDeadLetter(), "", true, false, false, false, nil)
 		if err != nil {
 			log.Printf("Failed to consume dead letter queue: %s\n", err)
 			return
